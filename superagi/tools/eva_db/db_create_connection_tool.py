@@ -86,4 +86,7 @@ class DbCreateConnectionTool(BaseTool):
         print(f"DbCreateConnectionTool running query {create_db_query}")
         cursor.query(create_db_query).df()
         cursor.close()
-        return f"Sucessfully created the desired connection to underlying database engine with name {db_connection_name}. This connection can now be used to query requested database."
+        return (
+            f"Sucessfully created the desired connection to underlying database engine with name {db_connection_name}. This connection can now be used to query requested database.",
+            f"connection_name: {db_connection_name}"
+        )
