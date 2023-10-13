@@ -4,20 +4,20 @@ import os
 import pandas as pd
 
 from enum import Enum, auto
+from evadb.interfaces.relational.db import connect_remote
 from typing import Type, Optional
 
 from pydantic import BaseModel, Field
 
+from superagi.helper.error_handler import ErrorHandler
 from superagi.helper.google_search import GoogleSearchWrap
 from superagi.helper.token_counter import TokenCounter
 from superagi.llms.base_llm import BaseLlm
 from superagi.tools.base_tool import BaseTool
 from urllib.parse import urlparse
 
-
 class TaskType(Enum):
     CLASSIFICATION = 1
-    FORECASTING = 2
 
 class DatasetType(Enum):
     LOCAL_CSV = 1
@@ -36,7 +36,7 @@ class ModelTrainSchema(BaseModel):
     )
     task_type: TaskType = Field(
         ...,
-        description="The type of training task. This should be the value for one of the TaskType Enums. Like 1 for CLASSIFICATION and 2 for FORECASTING",
+        description="The type of training task. This should be the value for one of the TaskType Enums. Like 1 for CLASSIFICATION."
     )
     dataset_type: DatasetType = Field(
         ...,
@@ -65,7 +65,20 @@ class ModelTrainTool(BaseTool):
     name = "ModelTrainTool"
     description = "A tool for training an ML model using on the provided dataset"
     args_schema: Type[ModelTrainSchema] = ModelTrainSchema
-    cursor: object = None 
+    cursor: object = None
+    agent_id: int = None
+    agent_execution_id: int = None
+    table_schema_prompt = """
+        This is top 5 rows of a CSV file: {csv_rows}
+        Generate a SQL query to create a table to store the above csv data. ENFORCE the following constraints in the generated SQL query.
+        1. Use IF NOT EXISTS clause.
+        2. DO NOT ADD any fields not present in the csv rows provided above.
+        3. USE the following template to decide the datatype of table attributes and use max values for the variables based on the csv row data above:
+            - INTEGER for INT
+            - TEXT(max_length) for VARCHAR(max_length)
+            - FLOAT(precision, scale) for FLOAT
+            - NDARRAY FLOAT32(precision) for N-dimensional array
+    """
 
     class Config:
         arbitrary_types_allowed = True
@@ -79,43 +92,31 @@ class ModelTrainTool(BaseTool):
                 dataset_df.to_csv(filename)
                 dataset_path = os.path.join(os.getcwd(), filename)
 
-            print("## data download done")
-            #TODO: generate the schema using df.head + llm
-            # Load the dataset into table if dataset is type CSV
-
             # create a table for the dataset
-            print("## starting data load")
-            # cursor = evadb.connect().cursor()
             table = 'dataset__' + os.path.splitext(filename)[0]
+            prompt = self.table_schema_prompt.format(
+                csv_rows = pd.read_csv(dataset_path).head(5)
+            )
+            messages = [{"role": "system", "content": prompt}]
+            result = self.llm.chat_completion(messages, max_tokens=self.max_token_limit)
 
-            create_table_query = f"""
-                CREATE TABLE IF NOT EXISTS {table} (
-                    number_of_rooms INTEGER,
-                    number_of_bathrooms INTEGER,
-                    sqft INTEGER,
-                    location TEXT(128),
-                    days_on_market INTEGER,
-                    initial_price INTEGER,
-                    neighborhood TEXT(128),
-                    rental_price FLOAT(1,1)
-                )
-            """
-            print("## CREATE_QUERY ", create_table_query)
-            create_response = self.cursor.query(create_table_query).df()
-            print(f"## CREATE RESPONSE: {create_response}")
+            if 'error' in result and result['message'] is not None:
+                ErrorHandler.handle_openai_errors(self.toolkit_config.session, self.agent_id, self.agent_execution_id, result['message'])
+            create_table_query =  result["content"]
+            self.cursor.query(create_table_query).df()
 
-            # load the dataset into the crated table
-            load_response = self.cursor.query(f"LOAD CSV '{dataset_path}' INTO {table}").df()
-            print(f"## load response: {load_response}")
+            # load the dataset into the created table
+            self.cursor.query(f"LOAD CSV '{dataset_path}' INTO {table}").df()
 
         except Exception as e:
-            error_msg= f"Failed to download the dataset locally due to error: {e}"
+            error_msg= f"Failed to load the dataset into evadb due to error: {e}"
             print(error_msg)
             return (None, error_msg)
         
         if dataset_type == DatasetType.EXTERNAL_CSV:
             try:
                 os.remove(dataset_path)
+                print('removed downloaded csv file')
             except:
                 pass
         return (table, None)
@@ -135,19 +136,17 @@ class ModelTrainTool(BaseTool):
         Returns:
             Response of the training query on EvaDB.
         """
-        print("####^^^^###")
         # 1. Create a table for the dataset in the underlying database.
         # 2. Load the dataset into the created table.
+        # 3. Train a model using the data in the created table.
 
-        self.cursor = evadb.connect().cursor()
+        self.cursor = connect_remote('evadb',8803).cursor()
         dataset_table, error = self._load_dataset(dataset_path, dataset_type)
         if dataset_table == None:
             print("LOAD FAILED")
             return ("Failed to compete the tool execution", f"reason: {error}")
         
-        # 3. Train a model using the data in the created table.
-        print(f"## task_type: {task_type} {TaskType.CLASSIFICATION.value}")
-        function_type =  'Ludwig' #task_type == 'Ludwig' if task_type == TaskType.CLASSIFICATION.value else 'Forecasting'
+        function_type =  'Ludwig'
         model_train_query = f"""
             CREATE OR REPLACE FUNCTION {task_name} FROM
             ( SELECT * FROM {dataset_table} )
@@ -155,27 +154,5 @@ class ModelTrainTool(BaseTool):
             PREDICT '{prediction_column}'
             TIME_LIMIT 3600;
         """
-        print(f"## train query: {model_train_query}")
         train_response = self.cursor.query(model_train_query).df()
-
-        print(f"## model train response {train_response}")
-
-        comp_result = self.cursor.query(f"""
-            SELECT rental_price, predicted_rental_price FROM {dataset_table}
-            JOIN LATERAL {task_name}(*) AS Predicted(predicted_rental_price) LIMIT 10;
-        """).df()
-
-        print(f"## comp result: {comp_result}")
-        return ("Successfully executed the provided query", "result: ")
-        
-
-
-
-# cursor.query(
-# """
-#     CREATE OR REPLACE FUNCTION rental_price_prediction FROM
-#     ( SELECT * FROM dataset__dataset_home_rentals )
-#     TYPE Ludwig
-#     PREDICT 'rental_price'
-#     TIME_LIMIT 3600;
-# """).df()
+        return ("Successfully executed the provided query", f"result: {train_response}")
