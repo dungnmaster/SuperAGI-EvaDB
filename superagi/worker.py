@@ -27,6 +27,7 @@ app.conf.broker_url = "redis://" + redis_url + "/0"
 app.conf.result_backend = "redis://" + redis_url + "/0"
 app.conf.worker_concurrency = 10
 app.conf.accept_content = ['application/x-python-serialize', 'application/json']
+app.conf.worker_redirect_stdouts = False
 
 
 beat_schedule = {

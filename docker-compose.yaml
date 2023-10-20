@@ -21,6 +21,15 @@ services:
     networks:
       - super_network
     command: ["/app/entrypoint_celery.sh"]
+  evadb:
+    image: "shashanksuman/evadb:0.3.7"
+    # ports:
+    #   - "8803:8803"
+    volumes:
+      - "./:/app"
+      - "${EXTERNAL_RESOURCE_DIR:-./workspace}:/app/ext"
+    networks:
+      - super_network
   gui:
     build:
       context: ./gui
